@@ -5,29 +5,46 @@ from kafka import KafkaProducer
 import json
 import os
 
+# -----------------------------------
+# Kafka Setup (Safe for Render)
+# -----------------------------------
+producer = None
+try:
+    kafka_server = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    producer = KafkaProducer(
+        bootstrap_servers=kafka_server,
+        value_serializer=lambda v: json.dumps(v).encode('utf-8')
+    )
+    print(f"✅ Connected to Kafka at {kafka_server}")
+except Exception as e:
+    print(f"⚠️ Kafka not available: {e}")
 
-producer = KafkaProducer(
-    bootstrap_servers='localhost:9092',
-    value_serializer=lambda v: json.dumps(v).encode('utf-8')
-)
-
+# -----------------------------------
+# Flask App
+# -----------------------------------
 app = Flask(__name__)
 CORS(app)
 
-# -----------------------------
-# Connect to PostgreSQL
-# -----------------------------
-conn = psycopg2.connect(
-DB_USER = os.environ.get("postgres"),
-DB_PASSWORD = os.environ.get("twitter77"),
-DB_HOST = os.environ.get("localhost"),
-DB_NAME = os.environ.get("mod_system")
-)
-cursor = conn.cursor()
+# -----------------------------------
+# PostgreSQL Connection
+# -----------------------------------
+try:
+    conn = psycopg2.connect(
+        host=os.environ.get("DB_HOST", "localhost"),
+        database=os.environ.get("DB_NAME", "mod_system"),
+        user=os.environ.get("DB_USER", "postgres"),
+        password=os.environ.get("DB_PASSWORD", "twitter77")
+    )
+    cursor = conn.cursor()
+    print("✅ Connected to PostgreSQL successfully")
+except Exception as e:
+    print(f"❌ PostgreSQL connection failed: {e}")
+    conn = None
+    cursor = None
 
-# -----------------------------
-# Helper: Map occurrence -> time_period
-# -----------------------------
+# -----------------------------------
+# Helper: Map occurrence -> time period
+# -----------------------------------
 def map_time_period(occurrence):
     mapping = {
         "UM1": "Morning",
@@ -39,11 +56,14 @@ def map_time_period(occurrence):
     }
     return mapping.get(occurrence, "Unknown")
 
-# -----------------------------
-# GET all modules
-# -----------------------------
+# -----------------------------------
+# Routes
+# -----------------------------------
 @app.route('/modules', methods=['GET'])
 def get_modules():
+    if not cursor:
+        return jsonify({"error": "Database not connected"}), 500
+
     cursor.execute("""
         SELECT Module_Code, Module_Name, Occurrence, Faculty, Prerequisite,
                module_start_time, module_end_time
@@ -66,11 +86,11 @@ def get_modules():
 
     return jsonify(modules)
 
-# -----------------------------
-# GET selected modules
-# -----------------------------
 @app.route('/selected_modules', methods=['GET'])
 def get_selected_modules():
+    if not cursor:
+        return jsonify({"error": "Database not connected"}), 500
+
     cursor.execute("""
         SELECT module_code, module_name, occurrence, faculty, prerequisite,
                module_start_time, module_end_time
@@ -92,20 +112,20 @@ def get_selected_modules():
 
     return jsonify(selected)
 
-# -----------------------------
-# DELETE a selected module
-# -----------------------------
 @app.route('/selected_modules/<module_code>', methods=['DELETE'])
 def remove_selected_module(module_code):
+    if not cursor:
+        return jsonify({"error": "Database not connected"}), 500
+
     cursor.execute("DELETE FROM selected_modules WHERE module_code = %s", (module_code,))
     conn.commit()
     return jsonify({"message": "Module removed successfully"}), 200
 
-# -----------------------------
-# POST add a new module
-# -----------------------------
 @app.route('/modules', methods=['POST'])
 def add_module():
+    if not cursor:
+        return jsonify({"error": "Database not connected"}), 500
+
     data = request.json
 
     module_code = data.get("id")
@@ -117,12 +137,10 @@ def add_module():
     end_time = data.get("end_time")
     student_id = data.get("student_id", "unknown")
 
-    # 1️ Prevent duplicate
     cursor.execute("SELECT 1 FROM selected_modules WHERE module_code = %s", (module_code,))
     if cursor.fetchone():
         return jsonify({"message": f"{module_name} is already selected."}), 400
 
-    # 2️ Prevent time clash (convert strings to TIME)
     cursor.execute("""
         SELECT module_code, module_name
         FROM selected_modules
@@ -134,7 +152,6 @@ def add_module():
     if clash:
         return jsonify({"message": f"Time clash detected with {clash[1]} ({clash[0]})"}), 400
 
-    # 3️ Insert module
     cursor.execute("""
         INSERT INTO selected_modules (module_code, module_name, occurrence, faculty, prerequisite, module_start_time, module_end_time)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -144,20 +161,19 @@ def add_module():
     new_module = cursor.fetchone()
     conn.commit()
 
-    # 4️ Kafka
-    message = {
-        "student_id": student_id,
-        "module_code": module_code,
-        "module_name": module_name,
-        "occurrence": occurrence,
-        "faculty": faculty,
-        "start_time": start_time,
-        "end_time": end_time
-    }
-    producer.send("module_selection_topic", message)
-    producer.flush()
+    if producer:
+        message = {
+            "student_id": student_id,
+            "module_code": module_code,
+            "module_name": module_name,
+            "occurrence": occurrence,
+            "faculty": faculty,
+            "start_time": start_time,
+            "end_time": end_time
+        }
+        producer.send("module_selection_topic", message)
+        producer.flush()
 
-    # 5️Return the added module to React
     return jsonify({
         "id": new_module[0],
         "name": new_module[1],
@@ -169,8 +185,8 @@ def add_module():
     }), 201
 
 
-# -----------------------------
-# Run the Flask server
-# -----------------------------
+# -----------------------------------
+# Run Server
+# -----------------------------------
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
